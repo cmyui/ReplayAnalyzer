@@ -102,6 +102,7 @@ namespace osu.ReplayAnalyzer
         private readonly WorkingBeatmap workingBeatmap;
         private readonly OsuRuleset ruleset;
         private IBeatmap? playableBeatmap;
+        private int replayVersion;
 
         public ReplayAnalyzer(string beatmapPath)
         {
@@ -111,7 +112,8 @@ namespace osu.ReplayAnalyzer
 
         public ReplaySimulationResult AnalyzeReplay(string replayPath)
         {
-            var (replay, mods) = LoadReplay(replayPath);
+            var (replay, mods, version) = LoadReplay(replayPath);
+            replayVersion = version;
 
             // Apply mods to beatmap
             playableBeatmap = workingBeatmap.GetPlayableBeatmap(ruleset.RulesetInfo, mods.ToArray());
@@ -119,7 +121,7 @@ namespace osu.ReplayAnalyzer
             return SimulateReplay(replay);
         }
 
-        private (Replay replay, List<Mod> mods) LoadReplay(string replayPath)
+        private (Replay replay, List<Mod> mods, int version) LoadReplay(string replayPath)
         {
             using var stream = File.OpenRead(replayPath);
             using var sr = new SerializationReader(stream);
@@ -199,7 +201,7 @@ namespace osu.ReplayAnalyzer
                 }
             }
 
-            return (replay, mods);
+            return (replay, mods, version);
         }
 
         private ReplaySimulationResult SimulateReplay(Replay replay)
@@ -301,9 +303,10 @@ namespace osu.ReplayAnalyzer
                         double timeOffset = currentTime - circle.StartTime;
                         HitResult hitResult = hitWindows.ResultFor(timeOffset);
 
-                        // Apply leniency: upgrade MEH to GREAT
-                        // Lazer appears to be more lenient with hit timing
-                        if (hitResult == HitResult.Meh)
+                        // Apply lazer-specific leniency: upgrade MEH to GREAT
+                        // Only for lazer replays (version >= 30000000)
+                        // Stable uses date format (e.g., 20211103), lazer uses 30000000+
+                        if (hitResult == HitResult.Meh && replayVersion >= 30000000)
                         {
                             hitResult = HitResult.Great;
                         }
@@ -358,9 +361,10 @@ namespace osu.ReplayAnalyzer
                                 double timeOffset = currentTime - slider.StartTime;
                                 HitResult hitResult = hitWindows.ResultFor(timeOffset);
 
-                                // Apply slider head leniency: upgrade MEH to GREAT
-                                // Lazer appears to be more lenient with hit timing for slider heads
-                                if (hitResult == HitResult.Meh)
+                                // Apply lazer-specific slider head leniency: upgrade MEH to GREAT
+                                // Only for lazer replays (version >= 30000000)
+                                // Stable uses date format (e.g., 20211103), lazer uses 30000000+
+                                if (hitResult == HitResult.Meh && replayVersion >= 30000000)
                                 {
                                     hitResult = HitResult.Great;
                                 }
