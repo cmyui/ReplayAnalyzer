@@ -234,6 +234,9 @@ namespace osu.ReplayAnalyzer
             // Create frame handler to manage replay frame state
             var frameHandler = new SimpleFrameHandler(replayFrames);
 
+            // Determine if we should use classic slider behavior (stable replays)
+            bool useClassicSliders = replayVersion < 30000000;
+
             // Track which objects have been judged
             var circles = playableBeatmap.HitObjects.OfType<HitCircle>().ToList();
             var sliders = playableBeatmap.HitObjects.OfType<Slider>().ToList();
@@ -241,6 +244,10 @@ namespace osu.ReplayAnalyzer
             var sliderTracking = new Dictionary<Slider, bool>();
             var sliderLastTrackingTime = new Dictionary<Slider, double>();
             var judgedSliderNestedObjects = new HashSet<HitObject>();
+
+            // Track slider nested object results for classic mode proportional judgement
+            var sliderNestedResults = new Dictionary<Slider, List<bool>>();
+            var sliderJudged = new HashSet<Slider>();
 
             // Get time range
             double startTime = playableBeatmap.HitObjects.First().StartTime - 2000;
@@ -345,9 +352,13 @@ namespace osu.ReplayAnalyzer
                             judgedCircles[slider.HeadCircle] = HitResult.Miss;
                             sliderTracking[slider] = false;
 
-                            if (!result.Statistics.ContainsKey(HitResult.Miss))
-                                result.Statistics[HitResult.Miss] = 0;
-                            result.Statistics[HitResult.Miss]++;
+                            // In classic mode, don't count slider head miss separately - only count the final slider judgement
+                            if (!useClassicSliders)
+                            {
+                                if (!result.Statistics.ContainsKey(HitResult.Miss))
+                                    result.Statistics[HitResult.Miss] = 0;
+                                result.Statistics[HitResult.Miss]++;
+                            }
 
                             currentCombo = 0;
                         }
@@ -371,9 +382,13 @@ namespace osu.ReplayAnalyzer
 
                                 judgedCircles[slider.HeadCircle] = hitResult;
 
-                                if (!result.Statistics.ContainsKey(hitResult))
-                                    result.Statistics[hitResult] = 0;
-                                result.Statistics[hitResult]++;
+                                // In classic mode, don't count slider head separately - only count the final slider judgement
+                                if (!useClassicSliders)
+                                {
+                                    if (!result.Statistics.ContainsKey(hitResult))
+                                        result.Statistics[hitResult] = 0;
+                                    result.Statistics[hitResult]++;
+                                }
 
                                 if (hitResult.IsHit())
                                 {
@@ -428,59 +443,125 @@ namespace osu.ReplayAnalyzer
                         if (judgedSliderNestedObjects.Contains(nested))
                             continue;
 
-                        if (nested.StartTime > currentTime + 0.5)
+                        // Apply -36ms tail leniency for proper timing
+                        const double TAIL_LENIENCY = -36.0;
+                        double judgeTime = nested is SliderTailCircle ? nested.StartTime + TAIL_LENIENCY : nested.StartTime;
+
+                        if (judgeTime > currentTime + 0.5)
                             continue;
 
-                        if (nested.StartTime <= currentTime)
+                        if (judgeTime <= currentTime)
                         {
                             judgedSliderNestedObjects.Add(nested);
 
                             bool wasTracking = sliderTracking.GetValueOrDefault(slider, false);
 
+                            // Initialize slider nested results list if needed
+                            if (!sliderNestedResults.ContainsKey(slider))
+                                sliderNestedResults[slider] = new List<bool>();
+
                             if (nested is SliderTick)
                             {
-                                var tickResult = wasTracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
+                                bool tickHit = wasTracking;
+                                sliderNestedResults[slider].Add(tickHit);
+
+                                var tickResult = tickHit ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
                                 if (!result.Statistics.ContainsKey(tickResult))
                                     result.Statistics[tickResult] = 0;
                                 result.Statistics[tickResult]++;
 
-                                if (tickResult.IsHit())
+                                // In modern mode, ticks award combo; in classic mode, they don't
+                                if (!useClassicSliders && tickResult.IsHit())
                                 {
                                     currentCombo++;
                                     result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                }
+                                else if (useClassicSliders && !tickHit)
+                                {
+                                    // In classic mode, missing a tick breaks combo
+                                    currentCombo = 0;
                                 }
                             }
                             else if (nested is SliderRepeat)
                             {
-                                var repeatResult = wasTracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
+                                bool repeatHit = wasTracking;
+                                sliderNestedResults[slider].Add(repeatHit);
+
+                                var repeatResult = repeatHit ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
                                 if (!result.Statistics.ContainsKey(repeatResult))
                                     result.Statistics[repeatResult] = 0;
                                 result.Statistics[repeatResult]++;
 
-                                if (repeatResult.IsHit())
+                                // In modern mode, repeats award combo; in classic mode, they don't
+                                if (!useClassicSliders && repeatResult.IsHit())
                                 {
                                     currentCombo++;
                                     result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                }
+                                else if (useClassicSliders && !repeatHit)
+                                {
+                                    // In classic mode, missing a repeat breaks combo
+                                    currentCombo = 0;
                                 }
                             }
                             else if (nested is SliderTailCircle tail)
                             {
-                                // Check if tracking was active recently (within 25ms) before slider end
-                                double lastTrackingTime = sliderLastTrackingTime.GetValueOrDefault(slider, double.NegativeInfinity);
-                                bool recentlyTracking = (tail.StartTime - lastTrackingTime) <= 25.0;
+                                bool tailHit = wasTracking;
+                                sliderNestedResults[slider].Add(tailHit);
 
-                                var tailResult = (wasTracking || recentlyTracking) ? HitResult.SliderTailHit : HitResult.IgnoreMiss;
+                                var tailResult = tailHit ? HitResult.SliderTailHit : HitResult.IgnoreMiss;
                                 if (!result.Statistics.ContainsKey(tailResult))
                                     result.Statistics[tailResult] = 0;
                                 result.Statistics[tailResult]++;
 
-                                // Check if slider tails affect combo
-                                if (tailResult.AffectsCombo() && tailResult.IsHit())
+                                // In modern mode, tails can award combo; in classic mode, they don't directly
+                                if (!useClassicSliders && tailResult.AffectsCombo() && tailResult.IsHit())
                                 {
                                     currentCombo++;
                                     result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
                                 }
                             }
+                        }
+                    }
+
+                    // After slider completes, judge it in classic mode
+                    if (useClassicSliders && !sliderJudged.Contains(slider) && currentTime > slider.GetEndTime() + 50)
+                    {
+                        sliderJudged.Add(slider);
+
+                        // Calculate slider judgement based on nested object completion
+                        if (sliderNestedResults.ContainsKey(slider) && judgedCircles.ContainsKey(slider.HeadCircle))
+                        {
+                            var nestedResults = sliderNestedResults[slider];
+                            int hitCount = nestedResults.Count(hit => hit);
+                            int totalCount = nestedResults.Count;
+
+                            // Include head in the calculation
+                            bool headHit = judgedCircles[slider.HeadCircle].IsHit();
+                            if (headHit)
+                                hitCount++;
+                            totalCount++;
+
+                            double hitFraction = totalCount > 0 ? (double)hitCount / totalCount : 0;
+
+                            HitResult sliderResult;
+                            if (hitFraction >= 1.0)
+                                sliderResult = HitResult.Great;
+                            else if (hitFraction >= 0.5)
+                                sliderResult = HitResult.Ok;
+                            else if (hitFraction > 0)
+                                sliderResult = HitResult.Meh;
+                            else
+                                sliderResult = HitResult.Miss;
+
+                            // Record the slider's judgement
+                            if (!result.Statistics.ContainsKey(sliderResult))
+                                result.Statistics[sliderResult] = 0;
+                            result.Statistics[sliderResult]++;
+
+                            // In classic mode, only the slider itself awards combo (not the nested objects)
+                            // But we already awarded combo for the head, so don't double-count
+                            // The slider's final judgement doesn't add more combo
                         }
                     }
                 }
