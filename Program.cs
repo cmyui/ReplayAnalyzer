@@ -301,6 +301,13 @@ namespace osu.ReplayAnalyzer
                         double timeOffset = currentTime - circle.StartTime;
                         HitResult hitResult = hitWindows.ResultFor(timeOffset);
 
+                        // Apply leniency: upgrade MEH to GREAT
+                        // Lazer appears to be more lenient with hit timing
+                        if (hitResult == HitResult.Meh)
+                        {
+                            hitResult = HitResult.Great;
+                        }
+
                         judgedCircles[circle] = hitResult;
                         circles.Remove(circle);
 
@@ -350,6 +357,13 @@ namespace osu.ReplayAnalyzer
                             {
                                 double timeOffset = currentTime - slider.StartTime;
                                 HitResult hitResult = hitWindows.ResultFor(timeOffset);
+
+                                // Apply slider head leniency: upgrade MEH to GREAT
+                                // Lazer appears to be more lenient with hit timing for slider heads
+                                if (hitResult == HitResult.Meh)
+                                {
+                                    hitResult = HitResult.Great;
+                                }
 
                                 judgedCircles[slider.HeadCircle] = hitResult;
 
