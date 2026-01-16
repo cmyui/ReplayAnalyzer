@@ -4,15 +4,19 @@ using System.IO;
 using System.Linq;
 using osu.Framework.Audio.Track;
 using osu.Framework.Graphics.Textures;
+using osu.Framework.Utils;
 using osu.Game.Beatmaps;
 using osu.Game.Beatmaps.Formats;
+using osu.Game.Beatmaps.Legacy;
 using osu.Game.IO;
 using osu.Game.IO.Legacy;
 using osu.Game.Replays;
 using osu.Game.Replays.Legacy;
 using osu.Game.Rulesets;
 using osu.Game.Rulesets.Judgements;
+using osu.Game.Rulesets.Mods;
 using osu.Game.Rulesets.Objects;
+using osu.Game.Rulesets.Objects.Types;
 using osu.Game.Rulesets.Osu;
 using osu.Game.Rulesets.Osu.Objects;
 using osu.Game.Rulesets.Osu.Replays;
@@ -96,23 +100,26 @@ namespace osu.ReplayAnalyzer
     class ReplayAnalyzer
     {
         private readonly WorkingBeatmap workingBeatmap;
-        private readonly IBeatmap playableBeatmap;
         private readonly OsuRuleset ruleset;
+        private IBeatmap? playableBeatmap;
 
         public ReplayAnalyzer(string beatmapPath)
         {
             workingBeatmap = LoadBeatmap(beatmapPath);
             ruleset = new OsuRuleset();
-            playableBeatmap = workingBeatmap.GetPlayableBeatmap(ruleset.RulesetInfo);
         }
 
         public ReplaySimulationResult AnalyzeReplay(string replayPath)
         {
-            var replay = LoadReplay(replayPath);
+            var (replay, mods) = LoadReplay(replayPath);
+
+            // Apply mods to beatmap
+            playableBeatmap = workingBeatmap.GetPlayableBeatmap(ruleset.RulesetInfo, mods.ToArray());
+
             return SimulateReplay(replay);
         }
 
-        private Replay LoadReplay(string replayPath)
+        private (Replay replay, List<Mod> mods) LoadReplay(string replayPath)
         {
             using var stream = File.OpenRead(replayPath);
             using var sr = new SerializationReader(stream);
@@ -138,9 +145,12 @@ namespace osu.ReplayAnalyzer
             sr.ReadInt32(); // Score
             sr.ReadUInt16(); // Max combo
             sr.ReadBoolean(); // Perfect
-            sr.ReadInt32(); // Mods
+            var modsInt = sr.ReadInt32(); // Mods
             sr.ReadString(); // HP graph
             sr.ReadDateTime(); // Date
+
+            // Convert mod int to Mod objects
+            var mods = ruleset.ConvertFromLegacyMods((LegacyMods)modsInt).ToList();
 
             // Read replay data
             byte[] compressedReplay = sr.ReadByteArray();
@@ -189,7 +199,7 @@ namespace osu.ReplayAnalyzer
                 }
             }
 
-            return replay;
+            return (replay, mods);
         }
 
         private ReplaySimulationResult SimulateReplay(Replay replay)
@@ -215,55 +225,250 @@ namespace osu.ReplayAnalyzer
                 }
             }
 
+            var replayFrames = replay.Frames.Cast<OsuReplayFrame>().OrderBy(f => f.Time).ToList();
+            if (replayFrames.Count == 0)
+                return result;
+
+            // Create frame handler to manage replay frame state
+            var frameHandler = new SimpleFrameHandler(replayFrames);
+
+            // Track which objects have been judged
+            var circles = playableBeatmap.HitObjects.OfType<HitCircle>().ToList();
+            var sliders = playableBeatmap.HitObjects.OfType<Slider>().ToList();
+            var judgedCircles = new Dictionary<HitCircle, HitResult>();
+            var sliderTracking = new Dictionary<Slider, bool>();
+            var sliderLastTrackingTime = new Dictionary<Slider, double>();
+            var judgedSliderNestedObjects = new HashSet<HitObject>();
+
+            // Get time range
+            double startTime = playableBeatmap.HitObjects.First().StartTime - 2000;
+            double endTime = playableBeatmap.HitObjects.Last().GetEndTime() + 1000;
+
+            // Time-step simulation (1ms precision)
+            const double TIME_STEP = 1.0;
+            double currentTime = startTime;
+
+            HashSet<OsuAction> previousActions = new HashSet<OsuAction>();
             int currentCombo = 0;
-            int frameIndex = 0;
-            var replayFrames = replay.Frames.Cast<OsuReplayFrame>().ToList();
 
-            // Process each hit object
-            foreach (var hitObject in playableBeatmap.HitObjects)
+            while (currentTime <= endTime)
             {
-                if (hitObject is HitCircle circle)
+                // Update frame handler for current time
+                frameHandler.SetFrameFromTime(currentTime);
+
+                // Get interpolated cursor position
+                Vector2 cursorPos = frameHandler.GetInterpolatedPosition();
+
+                // Get current pressed actions
+                var currentActions = new HashSet<OsuAction>(frameHandler.CurrentFrame?.Actions ?? new List<OsuAction>());
+
+                // Detect new key presses
+                var newPresses = currentActions.Except(previousActions).ToList();
+
+                // Process hit circles
+                foreach (var circle in circles.ToList())
                 {
-                    var circleResult = ProcessHitCircle(circle, replayFrames, ref frameIndex);
+                    if (judgedCircles.ContainsKey(circle))
+                        continue;
 
-                    if (!result.Statistics.ContainsKey(circleResult))
-                        result.Statistics[circleResult] = 0;
-                    result.Statistics[circleResult]++;
+                    var hitWindows = circle.HitWindows;
+                    double hitWindowMiss = hitWindows.WindowFor(HitResult.Meh);
 
-                    if (circleResult.IsHit())
+                    // Check if past miss window
+                    if (currentTime > circle.StartTime + hitWindowMiss)
                     {
-                        currentCombo++;
-                        result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
-                    }
-                    else if (circleResult == HitResult.Miss)
-                    {
+                        judgedCircles[circle] = HitResult.Miss;
+                        circles.Remove(circle);
+
+                        if (!result.Statistics.ContainsKey(HitResult.Miss))
+                            result.Statistics[HitResult.Miss] = 0;
+                        result.Statistics[HitResult.Miss]++;
+
                         currentCombo = 0;
+                        continue;
+                    }
+
+                    // Check if in hit window
+                    if (currentTime < circle.StartTime - hitWindowMiss)
+                        continue;
+
+                    // Check if hovered and key pressed
+                    float distance = Vector2.Distance(cursorPos, circle.StackedPosition);
+                    bool isHovered = distance <= circle.Radius;
+
+                    if (newPresses.Any() && isHovered)
+                    {
+                        double timeOffset = currentTime - circle.StartTime;
+                        HitResult hitResult = hitWindows.ResultFor(timeOffset);
+
+                        judgedCircles[circle] = hitResult;
+                        circles.Remove(circle);
+
+                        if (!result.Statistics.ContainsKey(hitResult))
+                            result.Statistics[hitResult] = 0;
+                        result.Statistics[hitResult]++;
+
+                        if (hitResult.IsHit())
+                        {
+                            currentCombo++;
+                            result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                        }
+                        else
+                        {
+                            currentCombo = 0;
+                        }
                     }
                 }
-                else if (hitObject is Slider slider)
+
+                // Process sliders
+                foreach (var slider in sliders)
                 {
-                    var sliderResults = ProcessSlider(slider, replayFrames, ref frameIndex);
-
-                    foreach (var sliderResult in sliderResults)
+                    // Handle slider head
+                    if (!judgedCircles.ContainsKey(slider.HeadCircle))
                     {
-                        if (!result.Statistics.ContainsKey(sliderResult))
-                            result.Statistics[sliderResult] = 0;
-                        result.Statistics[sliderResult]++;
+                        var hitWindows = slider.HeadCircle.HitWindows;
+                        double hitWindowMiss = hitWindows.WindowFor(HitResult.Meh);
 
-                        if (sliderResult.AffectsCombo())
+                        if (currentTime > slider.StartTime + hitWindowMiss)
                         {
-                            if (sliderResult.IsHit())
+                            // Missed slider head
+                            judgedCircles[slider.HeadCircle] = HitResult.Miss;
+                            sliderTracking[slider] = false;
+
+                            if (!result.Statistics.ContainsKey(HitResult.Miss))
+                                result.Statistics[HitResult.Miss] = 0;
+                            result.Statistics[HitResult.Miss]++;
+
+                            currentCombo = 0;
+                        }
+                        else if (currentTime >= slider.StartTime - hitWindowMiss)
+                        {
+                            float distance = Vector2.Distance(cursorPos, slider.HeadCircle.StackedPosition);
+                            bool isHovered = distance <= slider.Radius;
+
+                            if (newPresses.Any() && isHovered)
                             {
-                                currentCombo++;
-                                result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                double timeOffset = currentTime - slider.StartTime;
+                                HitResult hitResult = hitWindows.ResultFor(timeOffset);
+
+                                judgedCircles[slider.HeadCircle] = hitResult;
+
+                                if (!result.Statistics.ContainsKey(hitResult))
+                                    result.Statistics[hitResult] = 0;
+                                result.Statistics[hitResult]++;
+
+                                if (hitResult.IsHit())
+                                {
+                                    currentCombo++;
+                                    result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                    sliderTracking[slider] = true;
+                                }
+                                else
+                                {
+                                    currentCombo = 0;
+                                    sliderTracking[slider] = false;
+                                }
                             }
-                            else if (sliderResult.BreaksCombo())
+                        }
+                    }
+
+                    // Update slider tracking
+                    if (sliderTracking.GetValueOrDefault(slider, false) &&
+                        currentTime >= slider.StartTime &&
+                        currentTime <= slider.GetEndTime())
+                    {
+                        double progress = (currentTime - slider.StartTime) / slider.Duration;
+                        progress = Math.Clamp(progress, 0, 1);
+
+                        int span = (int)Math.Floor(progress * slider.SpanCount());
+                        double spanProgress = (progress * slider.SpanCount()) % 1.0;
+
+                        if (span % 2 == 1)
+                            spanProgress = 1 - spanProgress;
+
+                        Vector2 sliderBallPos = slider.Position + slider.Path.PositionAt(spanProgress) + slider.StackOffset;
+                        float sliderDistance = Vector2.Distance(cursorPos, sliderBallPos);
+                        // Add small tolerance to account for floating point precision at slider ends
+                        float followRadius = (float)(slider.Radius * 2.4) + 2.0f;
+
+                        bool keyPressed = currentActions.Count > 0;
+                        bool tracking = sliderDistance <= followRadius && keyPressed;
+
+                        if (tracking)
+                        {
+                            sliderLastTrackingTime[slider] = currentTime;
+                        }
+                        else
+                        {
+                            sliderTracking[slider] = false;
+                        }
+                    }
+
+                    // Judge nested objects at their times
+                    foreach (var nested in slider.NestedHitObjects)
+                    {
+                        if (judgedSliderNestedObjects.Contains(nested))
+                            continue;
+
+                        if (nested.StartTime > currentTime + 0.5)
+                            continue;
+
+                        if (nested.StartTime <= currentTime)
+                        {
+                            judgedSliderNestedObjects.Add(nested);
+
+                            bool wasTracking = sliderTracking.GetValueOrDefault(slider, false);
+
+                            if (nested is SliderTick)
                             {
-                                currentCombo = 0;
+                                var tickResult = wasTracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
+                                if (!result.Statistics.ContainsKey(tickResult))
+                                    result.Statistics[tickResult] = 0;
+                                result.Statistics[tickResult]++;
+
+                                if (tickResult.IsHit())
+                                {
+                                    currentCombo++;
+                                    result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                }
+                            }
+                            else if (nested is SliderRepeat)
+                            {
+                                var repeatResult = wasTracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss;
+                                if (!result.Statistics.ContainsKey(repeatResult))
+                                    result.Statistics[repeatResult] = 0;
+                                result.Statistics[repeatResult]++;
+
+                                if (repeatResult.IsHit())
+                                {
+                                    currentCombo++;
+                                    result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                }
+                            }
+                            else if (nested is SliderTailCircle tail)
+                            {
+                                // Check if tracking was active recently (within 25ms) before slider end
+                                double lastTrackingTime = sliderLastTrackingTime.GetValueOrDefault(slider, double.NegativeInfinity);
+                                bool recentlyTracking = (tail.StartTime - lastTrackingTime) <= 25.0;
+
+                                var tailResult = (wasTracking || recentlyTracking) ? HitResult.SliderTailHit : HitResult.IgnoreMiss;
+                                if (!result.Statistics.ContainsKey(tailResult))
+                                    result.Statistics[tailResult] = 0;
+                                result.Statistics[tailResult]++;
+
+                                // Check if slider tails affect combo
+                                if (tailResult.AffectsCombo() && tailResult.IsHit())
+                                {
+                                    currentCombo++;
+                                    result.MaxCombo = Math.Max(result.MaxCombo, currentCombo);
+                                }
                             }
                         }
                     }
                 }
+
+                previousActions = currentActions;
+                currentTime += TIME_STEP;
             }
 
             // Calculate accuracy
@@ -291,97 +496,79 @@ namespace osu.ReplayAnalyzer
             return result;
         }
 
-        private HitResult ProcessHitCircle(HitCircle circle, List<OsuReplayFrame> frames, ref int frameIndex)
+        private class SimpleFrameHandler
         {
-            var hitWindows = circle.HitWindows;
-            const float hitRadius = 64f; // OsuHitObject.OBJECT_RADIUS
+            private readonly List<OsuReplayFrame> frames;
+            private int currentFrameIndex = -1;
 
-            // Find frames around the hit circle's time
-            while (frameIndex < frames.Count && frames[frameIndex].Time < circle.StartTime - hitWindows.WindowFor(HitResult.Meh))
-                frameIndex++;
+            public double CurrentTime { get; private set; }
 
-            double closestTime = double.MaxValue;
-            OsuReplayFrame? hitFrame = null;
+            public OsuReplayFrame? CurrentFrame => currentFrameIndex >= 0 && currentFrameIndex < frames.Count
+                ? frames[currentFrameIndex]
+                : null;
 
-            // Look for a click within the hit window
-            for (int i = frameIndex; i < frames.Count; i++)
+            public OsuReplayFrame StartFrame => frames[Math.Max(0, currentFrameIndex)];
+            public OsuReplayFrame EndFrame => frames[Math.Min(currentFrameIndex + 1, frames.Count - 1)];
+
+            public SimpleFrameHandler(List<OsuReplayFrame> frames)
             {
-                var frame = frames[i];
-                double timeOffset = frame.Time - circle.StartTime;
-
-                if (timeOffset > hitWindows.WindowFor(HitResult.Meh))
-                    break;
-
-                if (frame.Actions.Count > 0)
-                {
-                    // Check if cursor is within hit circle
-                    float distance = Vector2.Distance(frame.Position, circle.StackedPosition);
-
-                    if (distance <= hitRadius && Math.Abs(timeOffset) < Math.Abs(closestTime))
-                    {
-                        closestTime = timeOffset;
-                        hitFrame = frame;
-                    }
-                }
+                this.frames = frames;
+                CurrentTime = double.NegativeInfinity;
             }
 
-            if (hitFrame != null)
+            public void SetFrameFromTime(double time)
             {
-                return hitWindows.ResultFor(closestTime);
+                if (frames.Count == 0)
+                {
+                    CurrentTime = time;
+                    return;
+                }
+
+                double frameStart = GetFrameTime(currentFrameIndex);
+                double frameEnd = GetFrameTime(currentFrameIndex + 1);
+
+                // If the proposed time is after the current frame end time, advance frames
+                while (frameEnd <= time && currentFrameIndex < frames.Count - 1)
+                {
+                    currentFrameIndex++;
+                    frameStart = GetFrameTime(currentFrameIndex);
+                    frameEnd = GetFrameTime(currentFrameIndex + 1);
+                }
+
+                // If the proposed time is before the current frame start time, go backwards
+                while (time < frameStart && currentFrameIndex > 0 && CurrentTime == frameStart)
+                {
+                    currentFrameIndex--;
+                    frameStart = GetFrameTime(currentFrameIndex);
+                    frameEnd = GetFrameTime(currentFrameIndex + 1);
+                }
+
+                CurrentTime = Math.Clamp(time, frameStart, frameEnd);
             }
 
-            return HitResult.Miss;
-        }
-
-        private List<HitResult> ProcessSlider(Slider slider, List<OsuReplayFrame> frames, ref int frameIndex)
-        {
-            var results = new List<HitResult>();
-            var hitWindows = slider.HitWindows;
-
-            // Process slider head (same as hit circle)
-            var headResult = ProcessHitCircle(slider.HeadCircle, frames, ref frameIndex);
-            results.Add(headResult);
-
-            // Process slider ticks and repeats
-            foreach (var nested in slider.NestedHitObjects)
+            public Vector2 GetInterpolatedPosition()
             {
-                if (nested is SliderTick tick)
-                {
-                    // Check if player is tracking the slider at tick time
-                    bool tracking = IsTrackingSlider(slider, frames, tick.StartTime);
-                    results.Add(tracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss);
-                }
-                else if (nested is SliderRepeat repeat)
-                {
-                    bool tracking = IsTrackingSlider(slider, frames, repeat.StartTime);
-                    results.Add(tracking ? HitResult.LargeTickHit : HitResult.LargeTickMiss);
-                }
-                else if (nested is SliderTailCircle tail)
-                {
-                    bool tracking = IsTrackingSlider(slider, frames, tail.StartTime);
-                    results.Add(tracking ? HitResult.SliderTailHit : HitResult.IgnoreMiss);
-                }
+                if (frames.Count == 0)
+                    return Vector2.Zero;
+
+                if (currentFrameIndex < 0)
+                    return frames[0].Position;
+
+                if (currentFrameIndex >= frames.Count - 1)
+                    return frames[frames.Count - 1].Position;
+
+                return Interpolation.ValueAt(CurrentTime, StartFrame.Position, EndFrame.Position,
+                    StartFrame.Time, EndFrame.Time);
             }
 
-            return results;
-        }
-
-        private bool IsTrackingSlider(Slider slider, List<OsuReplayFrame> frames, double time)
-        {
-            // Find frame at the given time
-            var frame = frames.FirstOrDefault(f => Math.Abs(f.Time - time) < 50);
-            if (frame == null) return false;
-
-            // Get slider position at this time
-            var progress = (time - slider.StartTime) / slider.Duration;
-            progress = Math.Clamp(progress, 0, 1);
-
-            // Simple approximation: check if cursor is reasonably close to slider
-            // In reality this should trace the slider path
-            const float followRadius = 64f * 2.4f;
-            float distance = Vector2.Distance(frame.Position, slider.StackedPosition);
-
-            return distance <= followRadius;
+            private double GetFrameTime(int index)
+            {
+                if (index < 0)
+                    return double.NegativeInfinity;
+                if (index >= frames.Count)
+                    return double.PositiveInfinity;
+                return frames[index].Time;
+            }
         }
 
         private IEnumerable<HitObject> EnumerateHitObjects(IBeatmap beatmap)
